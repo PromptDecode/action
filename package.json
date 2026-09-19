@@ -1,0 +1,14 @@
+{
+  "name": "promptdecode-action",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GitHub Action that runs promptdecode and reports hidden-text findings as SARIF annotations.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

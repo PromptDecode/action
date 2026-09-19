@@ -1,0 +1,205 @@
+# CI for promptdecode/action.
+#
+# Third-party/external actions (actions/checkout, actions/setup-node,
+# github/codeql-action inside action.yml) are pinned to major version tags
+# (@v3/@v4) for readability and to receive their fixes. A hardened consumer of
+# this repository may want to pin them to full commit SHAs instead.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Unit tests for bin/ and src/ ────────────────────────────────────────────
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: [20, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Install dependencies (only if a lockfile exists)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            echo "no package-lock.json: tests must run on the Node standard library alone"
+          fi
+      # `node --test` with no path argument. Do NOT "fix" this to
+      # `node --test test/`: since Node 22 a path argument is treated as a test
+      # file/glob to execute, and the directory form dies with
+      # "Cannot find module …/test" (verified on Node 24). The bare form
+      # recursively discovers test/ on both Node 20 and Node 24.
+      - name: Unit tests
+        shell: bash
+        run: node --test
+
+  # ── The action itself, with the permissions a same-repo push has ───────────
+  # security-events: write is present, so the real upload-sarif step really
+  # succeeds and findings really become check annotations.
+  #
+  # This job is GATED: asserting annotation-mode == "sarif" is only valid where
+  # the upload can succeed. On a pull_request FROM A FORK, GitHub forces the
+  # token read-only no matter what this job's permissions block says —
+  # security-events: write is not honoured, upload-sarif fails with a 403, and
+  # the action correctly falls back to workflow-commands. Ungated, that would
+  # turn the assertion below red and every fork PR with it. Hence: run on
+  # everything EXCEPT fork pull requests (push, workflow_dispatch, and
+  # same-repo pull requests); the fork case is exercised on purpose, in every
+  # context, by action-fork-fallback below.
+  action-sarif:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make the stub scanner executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x test/fixtures/stub-scanner.mjs
+      - name: Run the local action against the fixture repo
+        id: scan
+        uses: ./
+        with:
+          path: test/fixtures/repo
+          scanner-path: ${{ github.workspace }}/test/fixtures/stub-scanner.mjs
+          fail-on: none
+      # (The fork-PR case, where this assertion would legitimately see
+      # workflow-commands, never reaches this job — the gate above sends it to
+      # action-fork-fallback instead.)
+      - name: Assert findings arrived via the SARIF upload
+        shell: bash
+        env:
+          EXPECTED_MODE: sarif
+          EXPECTED_COUNT: '3'
+          ACTUAL_MODE: ${{ steps.scan.outputs.annotation-mode }}
+          ACTUAL_COUNT: ${{ steps.scan.outputs.results-count }}
+        run: |
+          set -euo pipefail
+          echo "comparing annotation-mode: expected '$EXPECTED_MODE', got '$ACTUAL_MODE'"
+          echo "comparing results-count:   expected '$EXPECTED_COUNT', got '$ACTUAL_COUNT'"
+          [ "$ACTUAL_MODE" = "$EXPECTED_MODE" ]
+          [ "$ACTUAL_COUNT" = "$EXPECTED_COUNT" ]
+
+  # ── The fork-pull-request test ─────────────────────────────────────────────
+  # This job's permissions block IS the test. A pull request opened from a fork
+  # gets the read-only default token: contents: read and nothing else — in
+  # particular no security-events: write. That is exactly the privilege this
+  # job grants, so the action's real upload-sarif step really fails (403) and
+  # the real workflow-commands fallback really runs. Nothing is mocked here,
+  # because the failure mode this design exists to prevent is a scanner that
+  # silently does nothing on a fork PR — precisely the hostile-content case.
+  #
+  # Asymmetry with action-sarif: THIS job runs in every context (push,
+  # workflow_dispatch, same-repo and fork pull requests) and asserts the same
+  # thing everywhere, because its own minimal permissions make the upload fail
+  # and the fallback run deterministically regardless of event or fork origin.
+  # action-sarif, by contrast, only runs where the upload CAN succeed — so
+  # between them the two fallback modes are covered on every PR without ever
+  # making a fork PR red.
+  action-fork-fallback:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make the stub scanner executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x test/fixtures/stub-scanner.mjs
+      - name: Run the local action against the fixture repo
+        id: scan
+        uses: ./
+        with:
+          path: test/fixtures/repo
+          scanner-path: ${{ github.workspace }}/test/fixtures/stub-scanner.mjs
+          fail-on: none
+      - name: Assert findings arrived via workflow commands
+        shell: bash
+        env:
+          EXPECTED_MODE: workflow-commands
+          EXPECTED_COUNT: '3'
+          ACTUAL_MODE: ${{ steps.scan.outputs.annotation-mode }}
+          ACTUAL_COUNT: ${{ steps.scan.outputs.results-count }}
+        run: |
+          set -euo pipefail
+          echo "comparing annotation-mode: expected '$EXPECTED_MODE', got '$ACTUAL_MODE'"
+          echo "comparing results-count:   expected '$EXPECTED_COUNT', got '$ACTUAL_COUNT'"
+          [ "$ACTUAL_MODE" = "$EXPECTED_MODE" ]
+          [ "$ACTUAL_COUNT" = "$EXPECTED_COUNT" ]
+
+  # ── fail-on is enforced by the action, not the scanner ─────────────────────
+  # The stub scanner always reports three findings — one error, one warning,
+  # one note — and exits 0/1 either way, so any failure below was decided by
+  # the action from the SARIF. Both invocations run with contents: read only,
+  # which also exercises the workflow-commands path.
+  action-fail-on:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make the stub scanner executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x test/fixtures/stub-scanner.mjs
+      # Invocation 1 — proves the warning rung of the ladder trips: the stub
+      # reports a warning, fail-on: warning means "fail if anything at warning
+      # severity or above exists", so the action must record outcome ==
+      # failure even though the scanner exited 1 (= findings, not error).
+      - name: 'Run with fail-on: warning (must fail)'
+        id: warn
+        uses: ./
+        continue-on-error: true
+        with:
+          path: test/fixtures/repo
+          scanner-path: ${{ github.workspace }}/test/fixtures/stub-scanner.mjs
+          fail-on: warning
+      # Invocation 2 — proves the error rung trips too: the stub also reports a
+      # full error, so the strictest threshold must fail as well, and
+      # max-severity must say which severity drove it.
+      - name: 'Run with fail-on: error (must fail)'
+        id: err
+        uses: ./
+        continue-on-error: true
+        with:
+          path: test/fixtures/repo
+          scanner-path: ${{ github.workspace }}/test/fixtures/stub-scanner.mjs
+          fail-on: error
+      # (That fail-on: none succeeds is asserted by the action-sarif and
+      # action-fork-fallback jobs above.)
+      - name: Assert both thresholds tripped
+        shell: bash
+        env:
+          EXPECTED_OUTCOME: failure
+          WARN_OUTCOME: ${{ steps.warn.outcome }}
+          ERR_OUTCOME: ${{ steps.err.outcome }}
+          ERR_MAX_SEVERITY_EXPECTED: error
+          ERR_MAX_SEVERITY: ${{ steps.err.outputs.max-severity }}
+        run: |
+          set -euo pipefail
+          echo "comparing fail-on:warning outcome: expected '$EXPECTED_OUTCOME', got '$WARN_OUTCOME'"
+          echo "comparing fail-on:error   outcome: expected '$EXPECTED_OUTCOME', got '$ERR_OUTCOME'"
+          echo "comparing fail-on:error   max-severity: expected '$ERR_MAX_SEVERITY_EXPECTED', got '$ERR_MAX_SEVERITY'"
+          [ "$WARN_OUTCOME" = "$EXPECTED_OUTCOME" ]
+          [ "$ERR_OUTCOME" = "$EXPECTED_OUTCOME" ]
+          [ "$ERR_MAX_SEVERITY" = "$ERR_MAX_SEVERITY_EXPECTED" ]

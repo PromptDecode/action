@@ -1,0 +1,90 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "promptdecode",
+          "informationUri": "https://github.com/PromptDecode/promptdecode",
+          "rules": [
+            {
+              "id": "bidi-control-character",
+              "shortDescription": { "text": "Bidirectional control character" }
+            },
+            {
+              "id": "hidden-html-comment",
+              "shortDescription": { "text": "Suspicious content in an HTML comment" }
+            },
+            {
+              "id": "zero-width-character",
+              "shortDescription": { "text": "Zero-width character" },
+              "defaultConfiguration": { "level": "note" }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "bidi-control-character",
+          "level": "error",
+          "message": {
+            "text": "Found 3 bidi control characters: U+202E, U+202D, U+2066"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "src/example.ts" },
+                "region": {
+                  "startLine": 12,
+                  "startColumn": 5,
+                  "endLine": 12,
+                  "endColumn": 21
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "hidden-html-comment",
+          "level": "warning",
+          "message": {
+            "text": "HTML comment reveals an API key"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "docs/readme.md" },
+                "region": {
+                  "startLine": 4,
+                  "startColumn": 1,
+                  "endLine": 4,
+                  "endColumn": 33
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "zero-width-character",
+          "message": {
+            "text": "Zero-width space hidden in SVG text"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "assets/logo.svg" },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 5
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
