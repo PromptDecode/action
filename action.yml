@@ -1,0 +1,271 @@
+name: 'promptdecode'
+description: 'Scan a repository for text a reviewer cannot see and an agent can.'
+branding:
+  icon: 'eye-off'
+  color: 'purple'
+
+# Composite on purpose: the SARIF upload needs `uses:`, the fork-PR fallback
+# needs `run:`, and this action needs both in one step list.
+#
+# Injection discipline: every input consumed by a `run:` step travels through
+# `env:` and is read as "$VAR" in the script body. No `${{ inputs.* }}` and no
+# `${{ github.event.* }}` ever appear inside a shell script.
+
+inputs:
+  path:
+    description: 'Path to scan (relative to the workspace, or absolute).'
+    required: false
+    default: '.'
+  engines:
+    description: 'Comma-separated engine list, passed to the scanner as --engines.'
+    required: false
+    default: 'all'
+  fail-on:
+    description: 'Severity that fails the action: none | note | warning | error. The action decides this from the SARIF; the scanner never does.'
+    required: false
+    default: 'error'
+  license:
+    description: 'Optional promptdecode licence key. Masked in job logs before first use.'
+    required: false
+    default: ''
+  version:
+    description: 'Scanner release tag to download, or "latest".'
+    required: false
+    default: 'latest'
+  scanner-repo:
+    description: 'Owner/name of the repository the scanner release binary is downloaded from.'
+    required: false
+    default: 'PromptDecode/promptdecode'
+  download-base-url:
+    description: 'Override the whole release URL prefix (mirrors, air-gapped runners, tests). Empty derives it from scanner-repo/version.'
+    required: false
+    default: ''
+  checksum:
+    description: 'Optional pinned SHA-256 of the scanner binary. When set it is authoritative.'
+    required: false
+    default: ''
+  scanner-path:
+    description: 'Path to an already-present scanner binary. When set, the download is skipped entirely.'
+    required: false
+    default: ''
+  sarif-file:
+    description: 'Where the scanner writes its SARIF report.'
+    required: false
+    default: 'promptdecode.sarif'
+  upload-sarif:
+    description: 'auto | never. "never" skips the SARIF upload and goes straight to workflow-command annotations. Any other value fails the action.'
+    required: false
+    default: 'auto'
+  token:
+    description: 'Token used for the SARIF upload.'
+    required: false
+    default: '${{ github.token }}'
+
+outputs:
+  sarif-file:
+    description: 'Path of the SARIF file the scanner produced.'
+    value: ${{ steps.outputs.outputs.sarif-file }}
+  results-count:
+    description: 'Number of findings in the SARIF report.'
+    value: ${{ steps.outputs.outputs.results-count }}
+  max-severity:
+    description: 'Highest severity among the findings: error | warning | note | none.'
+    value: ${{ steps.outputs.outputs.max-severity }}
+  annotation-mode:
+    description: 'How findings were surfaced: "sarif" (uploaded, check annotations) or "workflow-commands" (fork-PR fallback).'
+    value: ${{ steps.outputs.outputs.annotation-mode }}
+  scanner-path:
+    description: 'Path of the scanner binary that ran.'
+    value: ${{ steps.outputs.outputs.scanner-path }}
+  annotations-emitted:
+    description: 'Number of workflow-command annotations the report step emitted (always 0 in "sarif" mode).'
+    value: ${{ steps.outputs.outputs.annotations-emitted }}
+  failed:
+    description: 'Verdict of the run under the fail-on threshold: "true" when at least one finding is at or above fail-on, "false" otherwise.'
+    value: ${{ steps.outputs.outputs.failed }}
+
+runs:
+  using: composite
+  steps:
+    # 1 ── Mask first, so the licence can never reach the logs even if a later
+    #      step fails. The value rides in through env:, never through
+    #      interpolation into the script body.
+    - name: Mask the licence key
+      if: inputs.license != ''
+      shell: bash
+      env:
+        PROMPTDECODE_LICENSE: ${{ inputs.license }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::$PROMPTDECODE_LICENSE"
+
+    # 2 ── Validate `upload-sarif` before anything runs. Only `auto` and
+    #      `never` mean anything; anything else (a typo like "atuo") must fail
+    #      loudly here rather than silently behave as `auto`. The value rides
+    #      in through env:, never through interpolation into the script body.
+    - name: Validate the upload-sarif input
+      shell: bash
+      env:
+        PROMPTDECODE_UPLOAD_SARIF: ${{ inputs.upload-sarif }}
+      run: |
+        set -euo pipefail
+        case "$PROMPTDECODE_UPLOAD_SARIF" in
+          auto|never) ;;
+          *)
+            echo "::error::Invalid upload-sarif value '$PROMPTDECODE_UPLOAD_SARIF'. Valid values are: auto, never."
+            exit 1
+            ;;
+        esac
+
+    # 3 ── Download and checksum-verify the scanner binary. Skipped entirely
+    #      when `scanner-path` points at an already-present binary. bin/
+    #      download.mjs fails closed: exit 1 on any download or checksum
+    #      mismatch, and it sets the step outputs `path` and `sha256`.
+    - name: Download the scanner binary
+      if: inputs.scanner-path == ''
+      id: download
+      shell: bash
+      env:
+        PROMPTDECODE_DEST: ${{ runner.temp }}/promptdecode
+        PROMPTDECODE_REPO: ${{ inputs.scanner-repo }}
+        PROMPTDECODE_VERSION: ${{ inputs.version }}
+        PROMPTDECODE_BASE_URL: ${{ inputs.download-base-url }}
+        PROMPTDECODE_CHECKSUM: ${{ inputs.checksum }}
+      run: |
+        set -euo pipefail
+        args=(--dest "$PROMPTDECODE_DEST" --repo "$PROMPTDECODE_REPO" --version "$PROMPTDECODE_VERSION")
+        # Only forward the optional flags whose inputs are actually set.
+        if [ -n "$PROMPTDECODE_BASE_URL" ]; then args+=(--base-url "$PROMPTDECODE_BASE_URL"); fi
+        if [ -n "$PROMPTDECODE_CHECKSUM" ]; then args+=(--sha256 "$PROMPTDECODE_CHECKSUM"); fi
+        node "$GITHUB_ACTION_PATH/bin/download.mjs" "${args[@]}"
+
+    # 4 ── Resolve the binary: the user-provided scanner-path wins, otherwise
+    #      whatever the download step produced.
+    - name: Resolve the scanner binary path
+      id: bin
+      shell: bash
+      env:
+        PROMPTDECODE_SCANNER_PATH: ${{ inputs.scanner-path }}
+        PROMPTDECODE_DOWNLOADED_PATH: ${{ steps.download.outputs.path }}
+      run: |
+        set -euo pipefail
+        if [ -n "$PROMPTDECODE_SCANNER_PATH" ]; then
+          resolved="$PROMPTDECODE_SCANNER_PATH"
+        else
+          resolved="$PROMPTDECODE_DOWNLOADED_PATH"
+        fi
+        if [ -z "$resolved" ]; then
+          echo "::error::No scanner binary: 'scanner-path' was empty and the download step produced no path."
+          exit 1
+        fi
+        echo "path=$resolved" >> "$GITHUB_OUTPUT"
+
+    # 5 ── Scan. Exit-code contract: 0 = clean, 1 = findings reported — both
+    #      are fine here, because whether findings FAIL the action is decided
+    #      by `fail-on` in the report step below, from the SARIF. Anything
+    #      >= 2 (including shell-invented codes like 127 for a missing binary)
+    #      is a scanner error and fails this step. Afterwards, insist the SARIF
+    #      exists and is non-empty: a scanner that succeeds but writes nothing
+    #      must fail loudly, not silently pass.
+    - name: Run the promptdecode scan
+      id: scan
+      shell: bash
+      env:
+        PROMPTDECODE_BIN: ${{ steps.bin.outputs.path }}
+        PROMPTDECODE_SARIF: ${{ inputs.sarif-file }}
+        PROMPTDECODE_PATH: ${{ inputs.path }}
+        PROMPTDECODE_ENGINES: ${{ inputs.engines }}
+        PROMPTDECODE_LICENSE: ${{ inputs.license }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$(dirname "$PROMPTDECODE_SARIF")"
+        args=(--sarif "$PROMPTDECODE_SARIF" --path "$PROMPTDECODE_PATH")
+        if [ -n "$PROMPTDECODE_ENGINES" ]; then args+=(--engines "$PROMPTDECODE_ENGINES"); fi
+        if [ -n "$PROMPTDECODE_LICENSE" ]; then args+=(--license "$PROMPTDECODE_LICENSE"); fi
+
+        rc=0
+        "$PROMPTDECODE_BIN" "${args[@]}" || rc=$?
+        if [ "$rc" -ge 2 ]; then
+          echo "::error::promptdecode scanner exited with code $rc (>= 2 means a scanner error)."
+          exit "$rc"
+        fi
+        echo "scanner exit code $rc (0 = clean, 1 = findings reported)"
+
+        if [ ! -s "$PROMPTDECODE_SARIF" ]; then
+          echo "::error::Scanner exited $rc but the SARIF file '$PROMPTDECODE_SARIF' is missing or empty."
+          exit 1
+        fi
+
+    # 6 ── Upload the SARIF so findings become check annotations on the diff.
+    #      continue-on-error is the design, not a shrug: on a pull request from
+    #      a fork the token has no security-events: write, this step fails with
+    #      a 403, and the report step below falls back to workflow commands.
+    #      A fork PR is exactly where hostile content turns up, so the scan
+    #      must never silently do nothing there.
+    - name: Upload SARIF
+      id: upload
+      uses: github/codeql-action/upload-sarif@v3
+      if: inputs.upload-sarif != 'never' && steps.scan.outcome == 'success'
+      continue-on-error: true
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+        checkout_path: ${{ github.workspace }}
+        token: ${{ inputs.token }}
+
+    # 7 ── Report. mode "report" when the upload landed (annotations come from
+    #      the uploaded SARIF); otherwise mode "annotate", where bin/annotate.mjs
+    #      re-reads the SARIF and emits ::warning file=…,line=… workflow
+    #      commands so findings still annotate the diff. This step's non-zero
+    #      exit is how `fail-on` is enforced.
+    - name: Report findings, or fall back to workflow annotations
+      id: report
+      if: always() && steps.scan.outcome == 'success'
+      shell: bash
+      env:
+        PROMPTDECODE_SARIF: ${{ inputs.sarif-file }}
+        PROMPTDECODE_FAIL_ON: ${{ inputs.fail-on }}
+        PROMPTDECODE_UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+        PROMPTDECODE_WORKSPACE: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        mode=annotate
+        if [ "$PROMPTDECODE_UPLOAD_OUTCOME" = "success" ]; then mode=report; fi
+        if [ "$mode" = "annotate" ]; then
+          echo "::notice title=SARIF upload unavailable: falling back to workflow annotations::The SARIF upload did not succeed - usually a pull request from a fork, whose token cannot write security events. The scan still ran; each finding is re-emitted as a workflow-command annotation so it still shows on the diff."
+        fi
+        node "$GITHUB_ACTION_PATH/bin/annotate.mjs" \
+          --sarif "$PROMPTDECODE_SARIF" \
+          --workspace "$PROMPTDECODE_WORKSPACE" \
+          --mode "$mode" \
+          --fail-on "$PROMPTDECODE_FAIL_ON"
+
+    # 8 ── Map step outputs onto action outputs. `always()` is load-bearing:
+    #      when `fail-on` trips, step 7 exits 1, and a step after a failure is
+    #      skipped by default — without always() this step would not run and
+    #      every action output would be empty exactly when a consumer most
+    #      needs results-count and max-severity. The values are available in
+    #      that case because bin/annotate.mjs writes its outputs to
+    #      $GITHUB_OUTPUT before setting its exit code.
+    - name: Set action outputs
+      id: outputs
+      if: always()
+      shell: bash
+      env:
+        PROMPTDECODE_SARIF_OUT: ${{ inputs.sarif-file }}
+        PROMPTDECODE_RESULTS_COUNT: ${{ steps.report.outputs.results-count }}
+        PROMPTDECODE_MAX_SEVERITY: ${{ steps.report.outputs.max-severity }}
+        PROMPTDECODE_ANNOTATION_MODE: ${{ steps.report.outputs.annotation-mode }}
+        PROMPTDECODE_SCANNER_PATH: ${{ steps.bin.outputs.path }}
+        PROMPTDECODE_ANNOTATIONS_EMITTED: ${{ steps.report.outputs.annotations-emitted }}
+        PROMPTDECODE_FAILED: ${{ steps.report.outputs.failed }}
+      run: |
+        set -euo pipefail
+        {
+          echo "sarif-file=$PROMPTDECODE_SARIF_OUT"
+          echo "results-count=$PROMPTDECODE_RESULTS_COUNT"
+          echo "max-severity=$PROMPTDECODE_MAX_SEVERITY"
+          echo "annotation-mode=$PROMPTDECODE_ANNOTATION_MODE"
+          echo "scanner-path=$PROMPTDECODE_SCANNER_PATH"
+          echo "annotations-emitted=$PROMPTDECODE_ANNOTATIONS_EMITTED"
+          echo "failed=$PROMPTDECODE_FAILED"
+        } >> "$GITHUB_OUTPUT"

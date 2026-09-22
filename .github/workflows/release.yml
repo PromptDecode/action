@@ -1,0 +1,155 @@
+# Release workflow for promptdecode/action.
+#
+# The moving-tag contract:
+#
+#   Consumers pin `uses: promptdecode/action@v1`. `v1` is NOT a release tag
+#   for a single version — it is a MOVING tag that always points at the newest
+#   released v1.x.y commit. Cutting v1.4.2 force-moves `v1` onto the v1.4.2
+#   commit, so every consumer on @v1 picks the release up without editing
+#   their workflow. This workflow is the only thing allowed to move it, and it
+#   only does so after the unit tests AND a smoke run of the action itself are
+#   green — a tag can therefore never move past a red build.
+#
+#   Pre-release tags (v1.0.0-rc.1, v2.0.0-beta, anything containing `-`) are
+#   refused: an unstable tag must never drag the major tag along with it.
+#
+# Third-party/external actions (actions/checkout, actions/setup-node) are
+# pinned to major version tags (@v4) for readability. A hardened consumer of
+# this repository may want to pin them to full commit SHAs instead.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release, e.g. v1.4.2'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  # A `permissions` block replaces the default token scopes wholesale — every
+  # scope not listed here becomes `none`. The smoke run below asserts that
+  # findings arrive via the SARIF upload (annotation-mode == "sarif"), and
+  # github/codeql-action/upload-sarif needs security-events: write. Without
+  # this line the upload fails with a 403, the action (correctly) falls back
+  # to workflow-command annotations, and that assertion would fail — i.e.
+  # every release would be red.
+  security-events: write
+
+concurrency:
+  # Two releases racing each other could interleave the tag moves.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine the tag and its major version
+        id: tag
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$DISPATCH_TAG"
+          else
+            tag="$PUSH_TAG"
+          fi
+          # Strict semver shape: v + three numeric components, nothing
+          # trailing. A shell glob (v[0-9]*.[0-9]*.[0-9]*) would also admit
+          # v1.2.3.4 and v1.2.3rc1, so this is a real regex. A pre-release
+          # suffix (v1.0.0-rc.1 — anything containing '-') cannot match, so
+          # the refusal of pre-releases is part of the same check: an unstable
+          # tag must never move the major tag; only a stable vX.Y.Z may.
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$tag' is not a vX.Y.Z release tag: three numeric components, nothing trailing, no pre-release suffix. Cut a stable tag instead."
+            exit 1
+          fi
+          major="${tag%%.*}"
+          echo "Releasing $tag (moving tag: $major)"
+          echo "tag=$tag"     >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+
+      # Full history so the moving tag is pushed from a repo that knows the
+      # refs around it; checked out AT the tag so every later step tests
+      # exactly the commit the tag names, and HEAD == the release commit.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Make the stub scanner executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x test/fixtures/stub-scanner.mjs
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # Gate 1: the unit tests must pass before any tag moves.
+      - name: Unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          fi
+          node --test
+
+      # Gate 2: a smoke run of the action itself, against the stub scanner, so
+      # a tag can only ever move past a build in which the action end to end
+      # (scan, SARIF, reporting) actually works.
+      - name: Smoke-run the action against the stub scanner
+        id: smoke
+        uses: ./
+        with:
+          path: test/fixtures/repo
+          scanner-path: ${{ github.workspace }}/test/fixtures/stub-scanner.mjs
+          fail-on: none
+
+      - name: Assert the smoke run found the fixture findings
+        shell: bash
+        env:
+          EXPECTED_MODE: sarif
+          EXPECTED_COUNT: '3'
+          ACTUAL_MODE: ${{ steps.smoke.outputs.annotation-mode }}
+          ACTUAL_COUNT: ${{ steps.smoke.outputs.results-count }}
+        run: |
+          set -euo pipefail
+          echo "comparing annotation-mode: expected '$EXPECTED_MODE', got '$ACTUAL_MODE'"
+          echo "comparing results-count:   expected '$EXPECTED_COUNT', got '$ACTUAL_COUNT'"
+          [ "$ACTUAL_MODE" = "$EXPECTED_MODE" ]
+          [ "$ACTUAL_COUNT" = "$EXPECTED_COUNT" ]
+
+      # The moving-tag step. `git tag -f` re-points the major tag at the
+      # released commit even when it already exists; the push needs
+      # contents: write, which the checkout's persisted GITHUB_TOKEN carries.
+      - name: Force-move the major tag to this commit and push it
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          MAJOR: ${{ steps.tag.outputs.major }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "moving $MAJOR to $sha (release $TAG)"
+          git tag -f "$MAJOR" "$sha"
+          git push --force origin "refs/tags/$MAJOR:refs/tags/$MAJOR"
+          {
+            echo "Released $TAG."
+            echo ""
+            echo "Moving tag \`$MAJOR\` now points at \`$sha\`."
+            echo "Consumers on \`promptdecode/action@$MAJOR\` now resolve to this release."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Released $TAG: $MAJOR now points at $sha"

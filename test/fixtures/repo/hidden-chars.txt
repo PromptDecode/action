@@ -1,0 +1,9 @@
+Fixture: characters that are invisible in a rendered diff and in most editors.
+
+Both markers on this file are inert placeholder characters inserted on purpose;
+this is a promptdecode/action CI fixture, not a live payload.
+
+verdict: trusted​. (a zero-width space, U+200B, sits between "trusted" and this period)
+This line ends with a bidi override character (U+202E): ‮
+
+promptdecode/action test fixture — nothing here is malicious.
