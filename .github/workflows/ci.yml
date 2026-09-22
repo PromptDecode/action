@@ -132,6 +132,11 @@ jobs:
           path: test/fixtures/repo
           scanner-path: ${{ github.workspace }}/test/fixtures/stub-scanner.mjs
           fail-on: none
+          # A same-repository run cannot reproduce a fork's token: the upload
+          # can succeed even with contents: read. The fallback is taken on any
+          # upload outcome other than success, so skipping the upload drives
+          # the same branch a fork's refused upload does.
+          upload-sarif: never
       - name: Assert findings arrived via workflow commands
         shell: bash
         env:

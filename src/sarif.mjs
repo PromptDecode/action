@@ -92,6 +92,8 @@ function artifactUriToPath(uri, workspace) {
   }
 
   candidate = candidate.replaceAll('\\', '/');
+  // A file URI's pathname keeps the slash before a drive letter: /C:/x -> C:/x.
+  if (/^\/[A-Za-z]:\//.test(candidate)) candidate = candidate.slice(1);
   if (candidate.startsWith('./')) candidate = candidate.slice(2);
 
   if (path.isAbsolute(candidate)) {
@@ -99,7 +101,8 @@ function artifactUriToPath(uri, workspace) {
     // Outside-the-workspace absolute paths (rel starts with "..") stay
     // absolute so the annotation still points at something findable.
     if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
-      candidate = relative;
+      // path.relative answers with the platform separator; the result is POSIX.
+      candidate = relative.split(path.sep).join('/');
     }
   }
   return candidate;
