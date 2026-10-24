@@ -1,7 +1,7 @@
 # CI for promptdecode/action.
 #
 # Third-party/external actions (actions/checkout, actions/setup-node,
-# github/codeql-action inside action.yml) are pinned to major version tags
+# oven-sh/setup-bun, github/codeql-action inside action.yml) are pinned to major version tags
 # (@v3/@v4) for readability and to receive their fixes. A hardened consumer of
 # this repository may want to pin them to full commit SHAs instead.
 
@@ -27,17 +27,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # Keep setup-node: the action runs on Node at runtime (action.yml invokes
+      # `node`), and this matrix is what proves it on Node 20 and 24.
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.6"
       - name: Install dependencies (only if a lockfile exists)
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f package-lock.json ]; then
-            npm ci --no-audit --no-fund
+          if [ -f bun.lock ]; then
+            bun install --frozen-lockfile
           else
-            echo "no package-lock.json: tests must run on the Node standard library alone"
+            echo "no bun.lock: tests must run on the Node standard library alone"
           fi
       # `node --test` with no path argument. Do NOT "fix" this to
       # `node --test test/`: since Node 22 a path argument is treated as a test
